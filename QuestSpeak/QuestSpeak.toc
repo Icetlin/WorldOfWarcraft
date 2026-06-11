@@ -1,0 +1,9 @@
+## Interface: 120005, 11508, 110000
+## Title: QuestSpeak — Озвучка квестов (русский)
+## Notes: Передаёт текст квестов и диалогов в TTS-демон через глобальную Lua-переменную с уникальным маркером.
+## Author: ilia
+## Version: 1.9
+## SavedVariablesPerCharacter: QuestSpeakDB
+## DefaultState: enabled
+
+QuestSpeak.lua
