@@ -1,0 +1,11 @@
+# Python venv и TTS-модели — не нужны в репо, но живут рядом
+.venv/
+__pycache__/
+*.pyc
+models/
+*.onnx
+*.onnx.json
+
+# WoW-артефакты, которые могут появиться при тестах
+*.log
+.cache/

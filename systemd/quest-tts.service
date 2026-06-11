@@ -1,0 +1,27 @@
+[Unit]
+Description=QuestSpeak TTS daemon (WoW)
+Documentation=file:%h/quest_tts/README.md
+# Не обязательно After=... — демон сам переподключится, когда WoW появится.
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/quest_tts
+
+# python3 -m — корректный запуск как пакета. ExecStart использует venv.
+ExecStart=%h/quest_tts/.venv/bin/python3 -m daemon.quest_tts_daemon watch
+
+# Перезапуск при падении (WoW крашнулся, piper упал и т.п.)
+Restart=on-failure
+RestartSec=5
+
+# Мягкая остановка по SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Лог в journalctl --user -u quest-tts
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
