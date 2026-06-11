@@ -154,6 +154,8 @@ def read_quest_buffer(pid: int) -> Optional[str]:
 
     open_b = config.MARKER_OPEN_BYTES
     close_b = config.MARKER_CLOSE_BYTES
+    open_len = len(open_b)
+    close_len = len(close_b)
 
     for region in targets:
         if region.size > 200 * 1024 * 1024:  # >200 МБ — пропускаем
@@ -165,28 +167,64 @@ def read_quest_buffer(pid: int) -> Optional[str]:
                 log.debug("Не прочитан регион %s: %s", region, e)
             continue
 
-        idx = blob.find(open_b)
-        if idx < 0:
+        # Собираем все позиции открывающего и закрывающего маркеров.
+        # В heap может лежать несколько полных пар (старая dataFrame.text
+        # от прошлого квеста + новая), поэтому нужен явный «плотный»
+        # отбор: open и close из одной пары, без других open между ними.
+        opens: list[int] = []
+        closes: list[int] = []
+        p = 0
+        while True:
+            i = blob.find(open_b, p)
+            if i < 0:
+                break
+            opens.append(i)
+            p = i + 1
+        p = 0
+        while True:
+            i = blob.find(close_b, p)
+            if i < 0:
+                break
+            closes.append(i)
+            p = i + 1
+        if not opens or not closes:
             continue
 
-        # Нашли открывающий маркер. Ищем закрывающий после него.
-        close_idx = blob.find(close_b, idx + len(open_b))
-        if close_idx < 0:
-            # Маркер оборван — возможно, lua пишет строку прямо сейчас.
-            # Пропускаем, в следующем тике прочтём.
-            continue
+        # Идём от последнего open назад (самая свежая запись —
+        # последний аллок). Для каждого open ищем первый close после
+        # него; если между ними есть ещё один open — это close от
+        # более поздней пары, пропускаем.
+        for open_idx in reversed(opens):
+            close_after = [c for c in closes if c > open_idx]
+            if not close_after:
+                break  # нет ни одного close после любого open — мусор
+            close_idx = close_after[0]
 
-        text_bytes = blob[idx + len(open_b) : close_idx]
+            if any(o > open_idx and o < close_idx for o in opens):
+                # Между этим open и найденным close лежит ещё один open
+                # → close принадлежит более поздней паре, и байты между
+                # ними — мусор из heap, а не текст. Пропускаем.
+                continue
 
-        # WoW в Wine — всегда UTF-8.
-        try:
-            text = text_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            continue
+            text_bytes = blob[open_idx + open_len : close_idx]
+            if b"\x00" in text_bytes:
+                # NUL внутри пары = точно не квестовый текст (Lua-строки
+                # не содержат '\0' в нашем коде), пропускаем.
+                continue
 
-        text = text.strip()
-        if not text:
-            continue
-        return text
+            try:
+                text = text_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                # Битый UTF-8 между маркерами = скорее всего мусор.
+                continue
+
+            text = text.strip()
+            if not text:
+                continue
+
+            if config.DEBUG:
+                log.debug("Marker hit: len=%d preview=%r",
+                          len(text), text[:80])
+            return text
 
     return None
