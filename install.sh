@@ -117,20 +117,30 @@ VOICE_JSON="$MODELS_DIR/${VOICE_BASE}.onnx.json"
 if [ -f "$VOICE_ONNX" ] && [ -f "$VOICE_JSON" ]; then
     ok "Piper-модель уже на месте: $VOICE_ONNX"
 else
-    log "Скачиваю piper-модель $VOICE_BASE (~15 МБ)…"
+    log "Скачиваю piper-модель $VOICE_BASE (~60 МБ) через curl…"
     BASE_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium"
 
-    if command -v huggingface-cli >/dev/null 2>&1; then
-        huggingface-cli download rhasspy/piper-voices \
-            --include "ru/ru_RU/irina/medium/*" --local-dir "$MODELS_DIR"
-    else
-        warn "huggingface-cli не найден, качаю curl-ом напрямую"
-        curl -fL --progress-bar -o "$VOICE_ONNX" \
-            "$BASE_URL/${VOICE_BASE}.onnx"
-        curl -fL --progress-bar -o "$VOICE_JSON" \
-            "$BASE_URL/${VOICE_BASE}.onnx.json"
+    # Почему curl, а не huggingface-cli:
+    # утилита `huggingface-cli` в huggingface_hub ≥ 1.0 помечена
+    # «deprecated — no longer works» и вместо скачивания печатает help.
+    # Новая `hf` требует свежей версии huggingface_hub и не всегда
+    # установлена вместе с piper-tts. curl — детерминированно, без
+    # зависимостей.
+    if ! command -v curl >/dev/null 2>&1; then
+        err "curl не найден, поставьте его: sudo apt install curl"
+        exit 1
     fi
-    ok "Piper-модель скачана в $MODELS_DIR"
+
+    curl -fL --retry 3 --retry-delay 2 -o "$VOICE_ONNX" \
+        "$BASE_URL/${VOICE_BASE}.onnx"
+    curl -fL --retry 3 --retry-delay 2 -o "$VOICE_JSON" \
+        "$BASE_URL/${VOICE_BASE}.onnx.json"
+
+    if [ ! -s "$VOICE_ONNX" ] || [ ! -s "$VOICE_JSON" ]; then
+        err "Файлы модели не скачались (пустые или недоступны). Проверьте сеть."
+        exit 1
+    fi
+    ok "Piper-модель скачана в $MODELS_DIR ($(du -h "$VOICE_ONNX" | cut -f1))"
 fi
 
 # ─── 4. Тестовый прогон ───────────────────────────────────────────
