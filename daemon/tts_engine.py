@@ -52,31 +52,53 @@ def _detect_player() -> Optional[str]:
 
 def _play_wav(path: str) -> None:
     """Проиграть WAV-файл. Ждём завершения — иначе следующая фраза
-    наложится на текущую."""
-    player = _detect_player()
-    if not player:
+    наложится на текущую.
+
+    Если основной плеер не сработал (типичный случай: pw-play
+    установлен, но PipeWire-сессия не запущена → exit 1), пробуем
+    следующие по цепочке. paplay живёт в обоих мирах (PulseAudio и
+    PipeWire при наличии pipewire-pulse), поэтому почти всегда
+    выручает.
+    """
+    primary = _detect_player()
+    candidates: list[str] = []
+    if primary:
+        candidates.append(primary)
+    for fallback in ("paplay", "aplay", "ffplay"):
+        if fallback not in candidates and shutil.which(fallback):
+            candidates.append(fallback)
+
+    if not candidates:
         log.error("Нет доступного плеера (pw-play/paplay/aplay/ffplay). "
                   "Установите PulseAudio или PipeWire.")
         return
 
-    try:
-        if player == "pw-play":
-            # pw-play принимает WAV напрямую
-            subprocess.run([player, path], check=True, timeout=60)
-        elif player == "paplay":
-            subprocess.run([player, path], check=True, timeout=60)
-        elif player == "aplay":
-            subprocess.run([player, "-q", path], check=True, timeout=60)
-        elif player == "ffplay":
-            # ffplay -nodisp -autoexit -loglevel quiet
-            subprocess.run(
-                [player, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
-                check=True, timeout=60,
-            )
-    except subprocess.TimeoutExpired:
-        log.warning("Воспроизведение прервано по таймауту")
-    except subprocess.CalledProcessError as e:
-        log.error("Плеер %s завершился с ошибкой: %s", player, e)
+    for player in candidates:
+        try:
+            if player == "pw-play":
+                subprocess.run([player, path], check=True, timeout=60)
+            elif player == "paplay":
+                subprocess.run([player, path], check=True, timeout=60)
+            elif player == "aplay":
+                subprocess.run([player, "-q", path], check=True, timeout=60)
+            elif player == "ffplay":
+                subprocess.run(
+                    [player, "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                    check=True, timeout=60,
+                )
+            return  # success
+        except subprocess.TimeoutExpired:
+            log.warning("Плеер %s превысил таймаут", player)
+            return
+        except FileNotFoundError:
+            log.warning("Плеер %s исчез из PATH, пробую следующий", player)
+            continue
+        except subprocess.CalledProcessError as e:
+            log.warning("Плеер %s завершился с ошибкой (%s), пробую следующий",
+                        player, e)
+            continue
+
+    log.error("Ни один из %s не смог проиграть файл", candidates)
 
 
 # ─── Синтез речи ──────────────────────────────────────────────────

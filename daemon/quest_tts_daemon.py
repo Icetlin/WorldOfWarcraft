@@ -200,13 +200,13 @@ def _cmd_watch(backend: str) -> int:
             continue
 
         # 3) Обрабатываем результат
-        now = time.time()
-        if text and (text != last_text or
-                     (now - last_speak_time) > config.DEDUP_WINDOW):
+        # Говорим только если текст реально сменился. Если буфер
+        # опустел (закрыли квест) — сбрасываем last_text, чтобы при
+        # возврате к тому же квесту заново озвучить.
+        if text and text != last_text:
             log.info("→ %s", text[:200].replace("\n", " "))
             engine.speak(text)
             last_text = text
-            last_speak_time = now
         elif not text and last_text:
             # WoW ушёл с квеста, сбрасываем last_text, чтобы при
             # возврате к тому же квесту заново озвучить
