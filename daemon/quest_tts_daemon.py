@@ -158,7 +158,6 @@ def _cmd_watch(backend: str) -> int:
     engine = tts_engine.TTSEngine(backend=backend)
 
     last_text: Optional[str] = None
-    last_speak_time: float = 0.0
     wow_pid: Optional[int] = None
 
     stop = False
@@ -200,16 +199,25 @@ def _cmd_watch(backend: str) -> int:
             continue
 
         # 3) Обрабатываем результат
-        # Говорим только если текст реально сменился. Если буфер
-        # опустел (закрыли квест) — сбрасываем last_text, чтобы при
-        # возврате к тому же квесту заново озвучить.
+        # Lua-сторона кладёт в dataFrame.text строку формата
+        #   §QS§<eventId>|<текст>§/QS§
+        # где <eventId> — монотонный счётчик, инкрементируется ТОЛЬКО
+        # когда pushToBuffer реально записал что-то (т.е. прошёл
+        # Lua-овый dedup). Это решает оба кейса:
+        #   • «принял → сдал квест с тем же названием» — Lua пишет
+        #     с новым eventId, демон видит изменение, говорит;
+        #   • «игрок ничего не делает, тот же текст лежит в памяти» —
+        #     eventId тот же, демон молчит.
+        # Поэтому простой `text != last_text` корректен без всяких
+        # time-based окон. Если буфер вдруг опустел (Lua очистила
+        # маркер — сейчас этого не делает, но пусть будет) —
+        # сбрасываем last_text.
         if text and text != last_text:
             log.info("→ %s", text[:200].replace("\n", " "))
             engine.speak(text)
             last_text = text
         elif not text and last_text:
-            # WoW ушёл с квеста, сбрасываем last_text, чтобы при
-            # возврате к тому же квесту заново озвучить
+            log.debug("буфер пуст, сбрасываю last_text")
             last_text = None
 
         if _sleep_or_stop(config.SCAN_INTERVAL, lambda: stop):
@@ -248,8 +256,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="подробный лог",
     )
     parser.add_argument(
-        "--backend", choices=["auto", "piper", "espeak"], default="auto",
-        help="TTS-бэкенд (по умолчанию auto → piper с fallback на espeak)",
+        "--backend", choices=["auto", "silero", "piper", "espeak"], default="auto",
+        help="TTS-бэкенд (по умолчанию auto: silero → piper → espeak)",
     )
 
     sub = parser.add_subparsers(dest="cmd")

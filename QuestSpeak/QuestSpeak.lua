@@ -75,6 +75,13 @@ end
 local lastSpoken = {}
 local DEDUP_WINDOW = 4.0
 
+-- Монотонный счётчик «реально новых» событий. Инкрементируется
+-- ТОЛЬКО когда pushToBuffer действительно записал что-то в dataFrame.text
+-- (т.е. прошёл Lua-овый dedup). Демон использует его, чтобы отличать
+-- «тот же текст в памяти, потому что игрок ничего нового не делал»
+-- от «тот же текст, но это новый event (принял → сдал тот же квест)».
+local eventId = 0
+
 local function cleanText(text)
     if not text or text == "" then return "" end
     text = tostring(text)
@@ -108,8 +115,14 @@ local function pushToBuffer(text, eventName, questKey)
         return
     end
     lastSpoken[questKey] = { hash = hash, time = now }
-    dataFrame.text = MARKER_OPEN .. text .. MARKER_CLOSE
-    log(eventName .. " (" .. tostring(questKey) .. "): " ..
+    eventId = eventId + 1
+    -- Формат маркера: §QS§<eventId>|<text>§/QS§
+    -- eventId в начале позволяет демону дедуплицировать по счётчику,
+    -- а не по тексту. Это решает кейс «принял → сдал квест с тем же
+    -- названием»: Lua записывает НОВЫЙ eventId, демон видит изменение
+    -- и озвучивает заново.
+    dataFrame.text = MARKER_OPEN .. tostring(eventId) .. "|" .. text .. MARKER_CLOSE
+    log(eventName .. " (#" .. eventId .. ", " .. tostring(questKey) .. "): " ..
         text:sub(1, 80) .. (text:len() > 80 and "..." or ""))
 end
 

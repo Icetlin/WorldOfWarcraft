@@ -193,10 +193,198 @@ class _EspeakBackend:
             return None
 
 
+class _SileroBackend:
+    """Обёртка Silero TTS v4 (через torch.hub).
+
+    Silero — российская модель, обученная ПРЕИМУЩЕСТВЕННО на русском.
+    Голоса звучат как живые дикторы, в отличие от piper, который
+    режет интонации espeak-фонемизатором. На 5–10-секундных квестовых
+    фразах CPU inference занимает ~0.3 сек, GPU не нужен — а VRAM
+    остаётся свободной для WoW.
+    """
+
+    # Доступные русские голоса silero v4 (model="silero_tts", language="ru").
+    # У *v2 голосов sample_rate фиксирован в YAML — см. SPEAKER_SR ниже.
+    # Спикеры *_8khz / *_16khz используют СТАРУЮ jit-модель с другим API
+    # (hub.load возвращает 5 значений, а не 2), поэтому пока не поддержаны.
+    SPEAKERS = ("baya_v2", "irina_v2", "kseniya_v2",
+                "natasha_v2", "aidar_v2", "ruslan_v2")
+    # sample_rate для каждого голоса (из silero-models/models.yml).
+    # Для всех *v2 поддерживается только 8k/16k, 48k даёт pitch-shifted мусор.
+    SPEAKER_SR = {
+        "baya_v2":    16000,
+        "irina_v2":   16000,
+        "kseniya_v2": 16000,
+        "natasha_v2": 16000,
+        "aidar_v2":   16000,
+        "ruslan_v2":  16000,
+    }
+    SAMPLE_WIDTH = 2  # int16
+
+    def __init__(self, speaker: str = "baya_v2"):
+        if speaker not in self.SPEAKERS:
+            raise ValueError(
+                f"Неизвестный голос silero: {speaker!r}. "
+                f"Доступные: {', '.join(self.SPEAKERS)}"
+            )
+        self._speaker = speaker
+        # Спикеро-зависимая частота дискретизации (см. SPEAKER_SR).
+        # Не путать с v4_ru (там до 48kHz) — у *v2 только 8/16 kHz.
+        self._sample_rate = self.SPEAKER_SR[speaker]
+
+        import torch  # noqa: F401 — проверляем, что torch вообще есть
+        import torch.hub as hub
+
+        log.info("Загружаю silero v4 (голос: %s)…", speaker)
+        # torch.hub сам кеширует модель в ~/.cache/torch/hub/.
+        # trust_repo=True — silero-models это официальный репо Snakers,
+        # иначе torch.hub будет интерактивно спрашивать подтверждение.
+        self._model, _ = hub.load(
+            repo_or_dir="snakers4/silero-models",
+            model="silero_tts",
+            language="ru",
+            speaker=speaker,
+            trust_repo=True,
+        )
+        # CPU специально: для коротких фраз (<10 сек) GPU-overhead
+        # не окупается, а VRAM остаётся WoW'у. Если захочется
+        # ускорить — поменять на "cuda".
+        self._device = "cpu"
+        log.info("Silero v4 загружен: speaker=%s, device=%s, sr=%d",
+                 speaker, self._device, self._sample_rate)
+
+        # Акцентор: silero v2 ждёт ударения, размеченные '+' перед ударной
+        # гласной (Съ+ешьте). Без этого модель выдаёт тишину или кашу.
+        # ruaccent — нейросеть-акцентуатор, ~35 мс на фразу, грузим один раз.
+        # ВАЖНО: omograph_model_size="turbo" в новых версиях ruaccent ломает
+        # инференс (модель ждёт token_type_ids, который не подаётся) →
+        # process_all() падает с «Required inputs missing». Поэтому НЕ
+        # передаём omograph_model_size — дефолтный режим + словарь работает
+        # стабильно и не требует BERT-inputs.
+        self._accentor = None
+        try:
+            from ruaccent import RUAccent
+            acc = RUAccent()
+            acc.load(use_dictionary=True)
+            self._accentor = acc
+            log.info("ruaccent загружен (словарь)")
+        except Exception as e:
+            log.warning("ruaccent недоступен (%s) — silero будет выдавать "
+                        "тишину/кашу. Поставьте: pip install ruaccent", e)
+
+    # Silero v2 ругается warning'ом на тексты > 140 символов и реально
+    # деградирует: pitch-контур «плывёт», ударения теряются. Поэтому
+    # разбиваем длинные квестовые тексты на чанки по предложениям.
+    # Для квестов WoW типичная длина 30-80 символов, чанкинг сработает
+    # почти всегда «как есть» (1 чанк), а редкие длинные склеит из
+    # нескольких коротких с паузой между ними.
+    MAX_CHUNK_CHARS = 130
+
+    def _split_into_chunks(self, text: str) -> list[str]:
+        """Разбить текст на куски ≤ MAX_CHUNK_CHARS по границам предложений.
+
+        Стратегия:
+        1) Сначала пытаемся резать по . ! ? (сохраняя знак препинания).
+        2) Если предложение всё равно > MAX_CHUNK_CHARS — режем по
+           запятым/точкам с запятой.
+        3) Если и так не влезает (нет других знаков) — режем по словам
+           в районе границы. Крайний случай — один кусок, как было.
+        """
+        import re
+        # Сначала по предложениям
+        sentences = re.split(r'(?<=[.!?…])\s+', text.strip())
+        chunks: list[str] = []
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            if len(s) <= self.MAX_CHUNK_CHARS:
+                chunks.append(s)
+                continue
+            # Предложение длинное — режем по ; , :
+            parts = re.split(r'(?<=[;:])\s+|(?<=,)\s+', s)
+            buf = ""
+            for p in parts:
+                if buf and len(buf) + 1 + len(p) > self.MAX_CHUNK_CHARS:
+                    chunks.append(buf)
+                    buf = p
+                else:
+                    buf = (buf + " " + p).strip() if buf else p
+            if buf:
+                chunks.append(buf)
+        return chunks or [text]
+
+    def synthesize(self, text: str) -> Optional[bytes]:
+        # Шаг 1: простановка ударений. Silero v2 ждёт «+» перед ударной
+        # гласной (модель называется TTSModelAcc_v2 — Accentor). Без
+        # акцентора модель выдаёт тишину. ruaccent стоит ~35 мс на фразу.
+        if self._accentor is not None:
+            try:
+                text = self._accentor.process_all(text)
+            except Exception as e:
+                log.warning("ruaccent.process_all упал (%s), шлю без '+'", e)
+
+        # Шаг 2: разбить длинный текст на чанки ≤ 130 символов (silero v2
+        # деградирует на длинных строках, ругается warning'ом).
+        chunks = self._split_into_chunks(text)
+        if len(chunks) > 1:
+            log.debug("silero: разбил на %d чанк(ов) по %d..%d символов",
+                      len(chunks),
+                      min(len(c) for c in chunks),
+                      max(len(c) for c in chunks))
+
+        # Шаг 3: синтез каждого чанка отдельно, склейка PCM.
+        import torch
+        all_pcm: list[bytes] = []
+        silence_bytes: bytes = b""
+        for i, chunk in enumerate(chunks):
+            try:
+                audios = self._model.apply_tts(
+                    texts=chunk,
+                    sample_rate=self._sample_rate,
+                )
+            except Exception as e:
+                log.exception("Ошибка синтеза silero на чанке %d/%d: %s",
+                              i + 1, len(chunks), e)
+                continue
+
+            if not audios:
+                continue
+
+            # audio: torch.Tensor(float32) в [-0.1, 0.1] обычно. clamp +
+            # масштабирование в int16. Делаем один раз.
+            audio_int16 = (audios[0].clamp(-1.0, 1.0) * 32767).to(torch.int16)
+            all_pcm.append(audio_int16.numpy().tobytes())
+
+            # Пауза 0.15 сек между чанками, чтобы на стыке не было
+            # «проглатывания» последней гласной / склейки в одно слово.
+            if i + 1 < len(chunks) and not silence_bytes:
+                silence_samples = int(0.15 * self._sample_rate)
+                silence_bytes = (b"\x00\x00") * silence_samples
+
+        if not all_pcm:
+            return None
+
+        pcm_bytes = b"".join(
+            chunk + silence_bytes if i + 1 < len(all_pcm) else chunk
+            for i, chunk in enumerate(all_pcm)
+        )
+
+        import io
+        import wave
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(self.SAMPLE_WIDTH)
+            w.setframerate(self._sample_rate)
+            w.writeframes(pcm_bytes)
+        return buf.getvalue()
+
+
 # ─── TTS-движок (главный класс) ──────────────────────────────────
 
 class TTSEngine:
-    """Очередь + воркер + бэкенд (piper/espeak)."""
+    """Очередь + воркер + бэкенд (silero/piper/espeak)."""
 
     def __init__(self, backend: str = "auto"):
         self._backend = self._init_backend(backend)
@@ -208,6 +396,14 @@ class TTSEngine:
         self._worker.start()
 
     def _init_backend(self, backend: str):
+        # auto: silero → piper → espeak
+        if backend in ("silero", "auto"):
+            try:
+                return _SileroBackend(config.SILERO_SPEAKER)
+            except (ImportError, ValueError) as e:
+                if backend == "silero":
+                    raise
+                log.warning("silero недоступен (%s), пробую piper", e)
         if backend in ("piper", "auto"):
             try:
                 return _PiperBackend(config.PIPER_VOICE)
